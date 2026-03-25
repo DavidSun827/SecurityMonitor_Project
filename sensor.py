@@ -33,7 +33,10 @@ class SensorNode(CoreNode):
             self.target_name = "Backup Server"
             self.target_role = "backup"  # 【重要修改】故障转移后，不仅要换端口，还要换对方的公钥
         else:
-            print(f"[{self.node_id}] ❌ Backup Server is also unreachable. Retrying...")
+            print(f"[{self.node_id}] ❌ Backup Server unreachable. Switching back to Primary Server...")
+            self.current_target_port = config.PRIMARY_PORT
+            self.target_name = "Primary Server"
+            self.target_role = "primary"
 
     def run(self):
         print(f"[{self.node_id}] Started. Sending signed data every {config.SENSOR_INTERVAL} seconds...")

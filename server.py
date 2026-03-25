@@ -3,6 +3,7 @@ import threading
 import time
 import os
 import argparse
+import json
 import config
 from core_node import CoreNode
 
@@ -20,11 +21,19 @@ class ServerNode(CoreNode):
         self.first_heartbeat_received = False
         self.is_standalone = False
         self.recovery_logged = False
+        self.server_sock = None
+        self.sync_completed = False
+        project_root = os.path.dirname(os.path.abspath(__file__))
+        self.delta_recovery_file = os.path.join(project_root, "recovered_delta_data.txt")
+        self.local_state_file = os.path.join(project_root, f"node_state_{self.node_id}.txt")
 
         # ==========================================
         # 🛡️ 新增：状态历史记录 (用于恢复时的状态同步)
         # ==========================================
         self.state_history = []
+        self._ensure_delta_file_exists()
+        self._ensure_local_state_file_exists()
+        self.persisted_signatures = self._load_local_state_signatures()
 
     def start(self):
         """启动服务器及其所有后台线程"""
@@ -48,20 +57,84 @@ class ServerNode(CoreNode):
             print(f"\n[{self.node_id}] Shutting down gracefully.")
             self.is_running = False
 
+    def _record_signature(self, record):
+        """生成稳定签名，用于差量去重比对。"""
+        return json.dumps(record, sort_keys=True, ensure_ascii=False)
+
+    def _extract_delta_records(self, new_history):
+        """从同步历史中提取本节点宕机前未持久化过的差量记录。"""
+        return [item for item in new_history if self._record_signature(item) not in self.persisted_signatures]
+
+    def _persist_delta_records(self, delta_records):
+        """把差量记录持久化到 txt，防止重联后内存状态丢失。"""
+        if not delta_records:
+            return
+
+        with open(self.delta_recovery_file, "a", encoding="utf-8") as f:
+            f.write(f"\n=== SYNC_AT,{time.time()} ===\n")
+            for record in delta_records:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def _ensure_delta_file_exists(self):
+        """启动时确保恢复日志文件可见，避免无差量时用户看不到文件。"""
+        if os.path.exists(self.delta_recovery_file):
+            return
+
+        with open(self.delta_recovery_file, "w", encoding="utf-8") as f:
+            f.write("# recovered delta data log\n")
+            f.write("# each sync appends records missed during disconnection\n")
+
+    def _log_sync_status(self, status):
+        with open(self.delta_recovery_file, "a", encoding="utf-8") as f:
+            f.write(f"\n=== SYNC_STATUS,{time.time()},{status} ===\n")
+
+    def _ensure_local_state_file_exists(self):
+        if os.path.exists(self.local_state_file):
+            return
+
+        with open(self.local_state_file, "w", encoding="utf-8") as f:
+            f.write("# local durable state records for this node\n")
+
+    def _load_local_state_signatures(self):
+        signatures = set()
+        with open(self.local_state_file, "r", encoding="utf-8") as f:
+            for line in f:
+                text = line.strip()
+                if not text or text.startswith("#"):
+                    continue
+                try:
+                    record = json.loads(text)
+                    signatures.add(self._record_signature(record))
+                except json.JSONDecodeError:
+                    continue
+        return signatures
+
+    def _append_local_state_record(self, record):
+        signature = self._record_signature(record)
+        if signature in self.persisted_signatures:
+            return
+
+        with open(self.local_state_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        self.persisted_signatures.add(signature)
+
     def listen_for_connections(self, port_override=None):
         listen_port = port_override or self.port
-        server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server_sock.bind((self.host, listen_port))
-        server_sock.listen(5)
+        self.server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server_sock.bind((self.host, listen_port))
+        self.server_sock.listen(5)
 
         print(f"[{self.node_id}] 🛡️ Listening for secure connections on {listen_port}...")
 
         while self.is_running:
             try:
-                client_sock, addr = server_sock.accept()
+                client_sock, addr = self.server_sock.accept()
                 secure_sock = self.server_ssl_context.wrap_socket(client_sock, server_side=True)
                 threading.Thread(target=self.handle_client, args=(secure_sock,), daemon=True).start()
+            except OSError:
+                # Socket 被手动关闭（例如故障切换时释放旧端口），结束当前监听线程
+                break
             except Exception as e:
                 if self.is_running:
                     print(f"[{self.node_id}] Accept Error: {e}")
@@ -82,6 +155,7 @@ class ServerNode(CoreNode):
                 if msg_type == "data":
                     # 无论主备，都把数据存入历史记录 (最多保留 50 条防内存溢出)
                     self.state_history.append(payload)
+                    self._append_local_state_record(payload)
                     if len(self.state_history) > 50:
                         self.state_history.pop(0)
 
@@ -122,9 +196,34 @@ class ServerNode(CoreNode):
                 elif msg_type == "sync_response" and self.role == "backup":
                     history = payload.get("history", [])
                     self.state_history = history
+                    self.sync_completed = True
                     print(
                         f"[{self.node_id}] ✅ State synchronization complete. Reconciled {len(history)} historical records.")
                     # 同步完成，算作一次有效心跳，防止刚上线就误判超时
+
+                    # 提取并持久化“真正缺失”的差量数据，避免重联后丢失
+                    delta_records = self._extract_delta_records(history)
+                    self._persist_delta_records(delta_records)
+                    for record in delta_records:
+                        self._append_local_state_record(record)
+                    if delta_records:
+                        print(
+                            f"[{self.node_id}] 💾 Persisted {len(delta_records)} delta records to {self.delta_recovery_file}")
+                        self._log_sync_status(f"DELTA_{len(delta_records)}")
+                    else:
+                        self._log_sync_status("NO_DELTA")
+
+                    # ==========================================
+                    # 🚀 新增：把宕机期间错过的历史数据打印出来！
+                    # ==========================================
+                    if delta_records:
+                        print(f"[{self.node_id}] 📜 Replaying missed data from Primary:")
+                        for record in delta_records:
+                            temp = record.get('temperature', 'N/A')
+                            ts = record.get('timestamp', 'Unknown')
+                            print(f"    -> Recovered Record: Temp={temp}°C (Generated at {ts})")
+                    # ==========================================
+                    
                     self.last_heartbeat = time.time()
                     self.first_heartbeat_received = True
 
@@ -142,10 +241,14 @@ class ServerNode(CoreNode):
 
     def request_state_sync(self):
         """Backup 专属：上线时向 Primary 索要历史数据"""
-        time.sleep(1)  # 稍微等一秒，确保 Primary 已经启动
-        print(f"[{self.node_id}] 🔄 Requesting state synchronization from Primary...")
-        payload = {"type": "sync_request", "timestamp": time.time()}
-        self.send_secure_message(config.HOST, config.PRIMARY_PORT, payload, target_role="primary")
+        time.sleep(1.5)  # 稍微等待，确保 Primary 已经启动并稳定监听
+        while self.is_running and self.role == "backup" and not self.sync_completed:
+            print(f"[{self.node_id}] 🔄 Requesting state synchronization from Primary...")
+            payload = {"type": "sync_request", "timestamp": time.time()}
+            success = self.send_secure_message(config.HOST, config.PRIMARY_PORT, payload, target_role="primary")
+            if not success:
+                self._log_sync_status("REQUEST_SEND_FAILED")
+            time.sleep(2)
 
     def send_heartbeats(self):
         while self.is_running and self.role == "primary" and not self.is_standalone:
@@ -180,7 +283,14 @@ class ServerNode(CoreNode):
 
                 print(f"[{self.node_id}] ⚡ Executing FAILOVER: Promoting to Primary...")
 
+                try:
+                    if self.server_sock:
+                        self.server_sock.close()
+                except Exception:
+                    pass
+
                 self.role = "primary"
+                self._init_rsa_keys()
                 self.port = config.PRIMARY_PORT
                 self.is_standalone = True
 
