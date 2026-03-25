@@ -1,5 +1,5 @@
 import socket
-import time  # <--- 新增
+import time
 import config
 
 
@@ -9,10 +9,10 @@ def inject_primary_crash():
         admin_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         admin_socket.connect((config.HOST, config.ADMIN_PORT))
 
-        # --- 自动化记录 T0 ---
+        # --- Automatically record T0 ---
         with open("mttr_log.txt", "a") as f:
             f.write(f"T0_CRASH,{time.time()}\n")
-        # ----------------------
+        # --------------------------------
 
         admin_socket.sendall(b"INJECT_CRASH_PRIMARY")
         print("✅  FATAL CRASH command sent! Primary Server should be dead now.")

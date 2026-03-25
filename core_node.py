@@ -106,18 +106,18 @@ class CoreNode:
             data_dict = json.loads(data_bytes.decode('utf-8'))
 
             # ==========================================
-            # 🛡️ 新增：防重放攻击检测 (Anti-Replay Mechanism)
+            # Anti-replay check
             # ==========================================
             if "timestamp" in data_dict:
                 try:
                     ts_val = data_dict["timestamp"]
-                    # 兼容处理：如果是心跳包的 float，直接用；如果是 Sensor 的 string，则转换
+                    # Compatibility: heartbeat uses float; sensor payload uses formatted timestamp string
                     if isinstance(ts_val, (float, int)):
                         msg_time = float(ts_val)
                     else:
                         msg_time = datetime.strptime(ts_val, "%Y-%m-%d %H:%M:%S").timestamp()
 
-                    # 如果这根数据包的生成时间距离现在超过了 5 秒，判定为过期/重放攻击！
+                    # If message age exceeds 5 seconds, treat as expired/replayed and drop
                     if time.time() - msg_time > 5.0:
                         print(f"🚨 [{self.node_id}] SECURITY ALERT: Message expired/replayed! Payload dropped.")
                         return None

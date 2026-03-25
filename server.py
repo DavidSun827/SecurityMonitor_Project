@@ -14,7 +14,7 @@ class ServerNode(CoreNode):
 
         super().__init__(node_id=node_id, host=config.HOST, port=port, role=role)
 
-        # 状态与防抖标记
+        # Runtime state and debounce flags
         self.last_heartbeat = time.time()
         self.is_running = True
         self.first_heartbeat_received = False
@@ -22,15 +22,15 @@ class ServerNode(CoreNode):
         self.recovery_logged = False
 
         # ==========================================
-        # 🛡️ 新增：状态历史记录 (用于恢复时的状态同步)
+        # State history (used for recovery-time synchronization)
         # ==========================================
         self.state_history = []
 
     def start(self):
-        """启动服务器及其所有后台线程"""
+        """Start the server and all background threads."""
         print(f"[{self.node_id}] Starting as {self.role.upper()} on port {self.port}")
 
-        # 1. 启动主监听线程（接收 SSL 连接）
+        # 1. Start the main listener thread (accept SSL connections)
         threading.Thread(target=self.listen_for_connections, daemon=True).start()
 
         if self.role == "primary":
@@ -38,7 +38,7 @@ class ServerNode(CoreNode):
             threading.Thread(target=self.listen_admin_console, daemon=True).start()
         elif self.role == "backup":
             threading.Thread(target=self.monitor_heartbeat, daemon=True).start()
-            # 🚀 新增：Backup 启动时，主动向 Primary 请求同步历史状态
+            # Backup startup: proactively request state sync from Primary
             threading.Thread(target=self.request_state_sync, daemon=True).start()
 
         try:
@@ -77,10 +77,10 @@ class ServerNode(CoreNode):
                 msg_type = payload.get("type", "data")
 
                 # --------------------------------------------------
-                # 1. 处理业务数据 (Data)
+                # 1. Handle application data (Data)
                 # --------------------------------------------------
                 if msg_type == "data":
-                    # 无论主备，都把数据存入历史记录 (最多保留 50 条防内存溢出)
+                    # Both Primary and Backup append to history (cap at 50 to avoid memory growth)
                     self.state_history.append(payload)
                     if len(self.state_history) > 50:
                         self.state_history.pop(0)
@@ -100,7 +100,7 @@ class ServerNode(CoreNode):
                         print(f"[{self.node_id}] 🗂️ State Replicated securely: Temp={payload.get('temperature')}°C")
 
                 # --------------------------------------------------
-                # 2. 处理同步请求 (Backup 刚上线时发来的)
+                # 2. Handle sync request (sent by Backup on startup)
                 # --------------------------------------------------
                 elif msg_type == "sync_request" and self.role == "primary":
                     print(
@@ -108,28 +108,28 @@ class ServerNode(CoreNode):
                     response = {"type": "sync_response", "history": self.state_history}
                     self.send_secure_message(config.HOST, config.BACKUP_PORT, response, target_role="backup")
 
-                    # 极其重要：如果 Primary 是孤狼模式（前任 Backup 刚篡位的），此时它有了新小弟，彻底解除孤狼模式！
+                    # Important: if Primary is in standalone mode, a rejoined Backup exits standalone mode
                     if self.is_standalone:
                         print(
                             f"[{self.node_id}] 🤝 New Backup rejoined! Exiting Standalone Mode. Resuming heartbeats & replication.")
                         self.is_standalone = False
-                        # 重新启动发心跳的线程
+                        # Restart heartbeat thread
                         threading.Thread(target=self.send_heartbeats, daemon=True).start()
 
                 # --------------------------------------------------
-                # 3. 处理同步响应 (Primary 把历史数据发过来了)
+                # 3. Handle sync response (Primary returned history)
                 # --------------------------------------------------
                 elif msg_type == "sync_response" and self.role == "backup":
                     history = payload.get("history", [])
                     self.state_history = history
                     print(
                         f"[{self.node_id}] ✅ State synchronization complete. Reconciled {len(history)} historical records.")
-                    # 同步完成，算作一次有效心跳，防止刚上线就误判超时
+                    # Count sync completion as a valid heartbeat to avoid false timeout right after startup
                     self.last_heartbeat = time.time()
                     self.first_heartbeat_received = True
 
                 # --------------------------------------------------
-                # 4. 处理心跳包 (Heartbeat)
+                # 4. Handle heartbeat
                 # --------------------------------------------------
                 elif msg_type == "heartbeat" and self.role == "backup":
                     self.last_heartbeat = time.time()
@@ -141,8 +141,8 @@ class ServerNode(CoreNode):
             secure_sock.close()
 
     def request_state_sync(self):
-        """Backup 专属：上线时向 Primary 索要历史数据"""
-        time.sleep(1)  # 稍微等一秒，确保 Primary 已经启动
+        """Backup-only: request historical state from Primary on startup."""
+        time.sleep(1)  # Brief delay to ensure Primary has started
         print(f"[{self.node_id}] 🔄 Requesting state synchronization from Primary...")
         payload = {"type": "sync_request", "timestamp": time.time()}
         self.send_secure_message(config.HOST, config.PRIMARY_PORT, payload, target_role="primary")
