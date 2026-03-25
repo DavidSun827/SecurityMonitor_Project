@@ -1,4 +1,0 @@
-# recovered delta data log
-# each sync appends records missed during disconnection
-
-=== SYNC_STATUS,1774406072.649023,NO_DELTA ===
